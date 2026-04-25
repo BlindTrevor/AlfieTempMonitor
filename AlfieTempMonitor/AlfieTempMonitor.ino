@@ -18,7 +18,29 @@ bool fanWasOff = true;
 // Bi-colour 2-pin LED across D1/D2
 const int biPinA = 1;          // D1
 const int biPinB = 2;          // D2
-const float thresholdC = 22.0; // Red if over 20C, else green
+float thresholdC = 22.0;       // Red if over threshold, else green
+
+// Momentary push buttons
+const int btnUpPin   = 8;      // Increase threshold by 1°C
+const int btnDownPin = 9;      // Decrease threshold by 1°C
+
+const unsigned long DEBOUNCE_MS          = 50;    // debounce window
+const unsigned long THRESHOLD_DISPLAY_MS = 2000;  // how long to show new threshold
+const float THRESHOLD_MIN_C              = 0.0;   // minimum allowed threshold
+const float THRESHOLD_MAX_C              = 50.0;  // maximum allowed threshold
+
+// Debounce state for each button
+int  btnUpLastReading   = HIGH;
+int  btnUpStableState   = HIGH;
+unsigned long btnUpLastChangeMs   = 0;
+
+int  btnDownLastReading = HIGH;
+int  btnDownStableState = HIGH;
+unsigned long btnDownLastChangeMs = 0;
+
+// Threshold display state
+bool showingThreshold          = false;
+unsigned long thresholdShowMs  = 0;
 
 // -------- Fixed graph scale (NO autoscale) --------
 const float GRAPH_MIN_C = 10.0;
@@ -229,10 +251,45 @@ void snapshotGraphLevels() {
   lastGraphLevel[LCD_COLS - 1] = curLevel;
 }
 
+// Returns true once when the button on `pin` transitions to a stable LOW press.
+// Uses external stable/lastReading/lastChangeMs state variables for debouncing.
+bool buttonPressed(int pin,
+                   int &lastReading,
+                   int &stableState,
+                   unsigned long &lastChangeMs,
+                   unsigned long now) {
+  int reading = digitalRead(pin);
+  if (reading != lastReading) {
+    lastChangeMs = now;
+    lastReading  = reading;
+  }
+  if ((now - lastChangeMs) >= DEBOUNCE_MS && reading != stableState) {
+    stableState = reading;
+    if (stableState == LOW) return true;  // newly pressed
+  }
+  return false;
+}
+
+// Show the current threshold value on row 0 of the LCD.
+void displayThreshold() {
+  String line = "Threshold:" + String(thresholdC, 1) + (char)223 + "C";
+  uint8_t len = line.length();
+  if (len > LCD_COLS) len = LCD_COLS;
+  uint8_t col = (LCD_COLS - len) / 2;
+
+  lcd.setCursor(0, 0);
+  for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
+  lcd.setCursor(col, 0);
+  lcd.print(line.substring(0, len));
+}
+
 void setup() {
   pinMode(biPinA, OUTPUT);
   pinMode(biPinB, OUTPUT);
   biOff();
+
+  pinMode(btnUpPin,   INPUT_PULLUP);
+  pinMode(btnDownPin, INPUT_PULLUP);
 
   lcd.init();
   lcd.backlight();
@@ -272,6 +329,30 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // 0) Read push buttons and adjust threshold
+  if (buttonPressed(btnUpPin,   btnUpLastReading,   btnUpStableState,   btnUpLastChangeMs,   now)) {
+    if (thresholdC < THRESHOLD_MAX_C) {
+      thresholdC += 1.0;
+    }
+    showingThreshold = true;
+    thresholdShowMs  = now;
+    displayThreshold();
+  }
+  if (buttonPressed(btnDownPin, btnDownLastReading, btnDownStableState, btnDownLastChangeMs, now)) {
+    if (thresholdC > THRESHOLD_MIN_C) {
+      thresholdC -= 1.0;
+    }
+    showingThreshold = true;
+    thresholdShowMs  = now;
+    displayThreshold();
+  }
+
+  // When the threshold-display window expires, revert to normal view
+  if (showingThreshold && (now - thresholdShowMs >= THRESHOLD_DISPLAY_MS)) {
+    showingThreshold = false;
+    lastShownC10 = 99999;  // force a full redraw on the next display tick
+  }
 
   // 1) Sample every second
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
@@ -331,16 +412,18 @@ void loop() {
     bool gChanged = graphChanged();
 
     if (tempChanged || gChanged) {
-      // Row 0: centered temperature
-      String line0 = "-= " + String(avgC, 1) + (char)223 + "C =-";
-      uint8_t len = line0.length();
-      if (len > LCD_COLS) len = LCD_COLS;
-      uint8_t col = (LCD_COLS - len) / 2;
+      // Row 0: centered temperature (skip if currently showing threshold)
+      if (!showingThreshold) {
+        String line0 = "-= " + String(avgC, 1) + (char)223 + "C =-";
+        uint8_t len = line0.length();
+        if (len > LCD_COLS) len = LCD_COLS;
+        uint8_t col = (LCD_COLS - len) / 2;
 
-      lcd.setCursor(0, 0);
-      for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
-      lcd.setCursor(col, 0);
-      lcd.print(line0.substring(0, len));
+        lcd.setCursor(0, 0);
+        for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
+        lcd.setCursor(col, 0);
+        lcd.print(line0.substring(0, len));
+      }
 
       // Row 1: graph (no ticks)
       drawGraphRow();
