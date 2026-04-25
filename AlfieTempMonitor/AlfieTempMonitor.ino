@@ -18,7 +18,39 @@ bool fanWasOff = true;
 // Bi-colour 2-pin LED across D1/D2
 const int biPinA = 1;          // D1
 const int biPinB = 2;          // D2
-const float thresholdC = 22.0; // Red if over 20C, else green
+float thresholdC = 22.0;       // Red if over threshold, else green
+
+// Momentary push buttons
+const int btnUpPin   = 8;      // Increase threshold by 1°C
+const int btnDownPin = 9;      // Decrease threshold by 1°C
+
+const unsigned long DEBOUNCE_MS          = 50;    // debounce window
+const unsigned long THRESHOLD_DISPLAY_MS = 2000;  // how long to show new threshold
+const float THRESHOLD_MIN_C              = 0.0;   // minimum allowed threshold
+const float THRESHOLD_MAX_C              = 50.0;  // maximum allowed threshold
+
+// Hold-to-repeat timing
+const unsigned long HOLD_DELAY_MS   = 600;   // initial pause before repeat starts
+const unsigned long REPEAT_FAST_MS  = 100;   // fast repeat interval (after HOLD_FAST_MS)
+const unsigned long REPEAT_SLOW_MS  = 300;   // slow repeat interval (before HOLD_FAST_MS)
+const unsigned long HOLD_FAST_MS    = 2000;  // switch to fast repeat after holding this long
+
+// Debounce + hold state for each button
+int  btnUpLastReading   = HIGH;
+int  btnUpStableState   = HIGH;
+unsigned long btnUpLastChangeMs   = 0;
+unsigned long btnUpPressedMs      = 0;  // when the button was first confirmed pressed
+unsigned long btnUpLastRepeatMs   = 0;  // when we last fired a repeat
+
+int  btnDownLastReading = HIGH;
+int  btnDownStableState = HIGH;
+unsigned long btnDownLastChangeMs = 0;
+unsigned long btnDownPressedMs    = 0;
+unsigned long btnDownLastRepeatMs = 0;
+
+// Threshold display state
+bool showingThreshold          = false;
+unsigned long thresholdShowMs  = 0;
 
 // -------- Fixed graph scale (NO autoscale) --------
 const float GRAPH_MIN_C = 10.0;
@@ -229,10 +261,69 @@ void snapshotGraphLevels() {
   lastGraphLevel[LCD_COLS - 1] = curLevel;
 }
 
+// Returns true once when the button transitions to a stable LOW (initial press).
+// Records pressedMs so hold-to-repeat can use it.
+bool buttonPressed(int pin,
+                   int &lastReading,
+                   int &stableState,
+                   unsigned long &lastChangeMs,
+                   unsigned long &pressedMs,
+                   unsigned long &lastRepeatMs,
+                   unsigned long now) {
+  int reading = digitalRead(pin);
+  if (reading != lastReading) {
+    lastChangeMs = now;
+    lastReading  = reading;
+  }
+  if ((now - lastChangeMs) >= DEBOUNCE_MS && reading != stableState) {
+    stableState = reading;
+    if (stableState == LOW) {
+      pressedMs    = now;
+      lastRepeatMs = now;
+      return true;   // newly pressed
+    }
+  }
+  return false;
+}
+
+// Returns true on each hold-to-repeat tick while the button stays pressed.
+// Uses an accelerating interval: slow after HOLD_DELAY_MS, fast after HOLD_FAST_MS.
+bool buttonHeldTick(int stableState,
+                    unsigned long pressedMs,
+                    unsigned long &lastRepeatMs,
+                    unsigned long now) {
+  if (stableState != LOW) return false;            // button not held
+  unsigned long held = now - pressedMs;
+  if (held < HOLD_DELAY_MS) return false;          // still in initial delay
+
+  unsigned long interval = (held >= HOLD_FAST_MS) ? REPEAT_FAST_MS : REPEAT_SLOW_MS;
+  if (now - lastRepeatMs >= interval) {
+    lastRepeatMs = now;
+    return true;
+  }
+  return false;
+}
+
+// Show the current threshold value on row 0 of the LCD.
+void displayThreshold() {
+  String line = "Threshold:" + String(thresholdC, 1) + (char)223 + "C";
+  uint8_t len = line.length();
+  if (len > LCD_COLS) len = LCD_COLS;
+  uint8_t col = (LCD_COLS - len) / 2;
+
+  lcd.setCursor(0, 0);
+  for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
+  lcd.setCursor(col, 0);
+  lcd.print(line.substring(0, len));
+}
+
 void setup() {
   pinMode(biPinA, OUTPUT);
   pinMode(biPinB, OUTPUT);
   biOff();
+
+  pinMode(btnUpPin,   INPUT_PULLUP);
+  pinMode(btnDownPin, INPUT_PULLUP);
 
   lcd.init();
   lcd.backlight();
@@ -272,6 +363,35 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // 0) Read push buttons and adjust threshold (with hold-to-repeat acceleration)
+  bool upPressed   = buttonPressed(btnUpPin,   btnUpLastReading,   btnUpStableState,   btnUpLastChangeMs,   btnUpPressedMs,   btnUpLastRepeatMs,   now);
+  bool upHeld      = buttonHeldTick(btnUpStableState,   btnUpPressedMs,   btnUpLastRepeatMs,   now);
+  bool downPressed = buttonPressed(btnDownPin, btnDownLastReading, btnDownStableState, btnDownLastChangeMs, btnDownPressedMs, btnDownLastRepeatMs, now);
+  bool downHeld    = buttonHeldTick(btnDownStableState, btnDownPressedMs, btnDownLastRepeatMs, now);
+
+  if (upPressed || upHeld) {
+    if (thresholdC < THRESHOLD_MAX_C) {
+      thresholdC += 1.0;
+    }
+    showingThreshold = true;
+    thresholdShowMs  = now;
+    displayThreshold();
+  }
+  if (downPressed || downHeld) {
+    if (thresholdC > THRESHOLD_MIN_C) {
+      thresholdC -= 1.0;
+    }
+    showingThreshold = true;
+    thresholdShowMs  = now;
+    displayThreshold();
+  }
+
+  // When the threshold-display window expires, revert to normal view
+  if (showingThreshold && (now - thresholdShowMs >= THRESHOLD_DISPLAY_MS)) {
+    showingThreshold = false;
+    lastShownC10 = 99999;  // force a full redraw on the next display tick
+  }
 
   // 1) Sample every second
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
@@ -331,16 +451,18 @@ void loop() {
     bool gChanged = graphChanged();
 
     if (tempChanged || gChanged) {
-      // Row 0: centered temperature
-      String line0 = "-= " + String(avgC, 1) + (char)223 + "C =-";
-      uint8_t len = line0.length();
-      if (len > LCD_COLS) len = LCD_COLS;
-      uint8_t col = (LCD_COLS - len) / 2;
+      // Row 0: centered temperature (skip if currently showing threshold)
+      if (!showingThreshold) {
+        String line0 = "-= " + String(avgC, 1) + (char)223 + "C =-";
+        uint8_t len = line0.length();
+        if (len > LCD_COLS) len = LCD_COLS;
+        uint8_t col = (LCD_COLS - len) / 2;
 
-      lcd.setCursor(0, 0);
-      for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
-      lcd.setCursor(col, 0);
-      lcd.print(line0.substring(0, len));
+        lcd.setCursor(0, 0);
+        for (uint8_t i = 0; i < LCD_COLS; i++) lcd.print(' ');
+        lcd.setCursor(col, 0);
+        lcd.print(line0.substring(0, len));
+      }
 
       // Row 1: graph (no ticks)
       drawGraphRow();
