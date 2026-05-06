@@ -13,7 +13,7 @@ const uint8_t LCD_COLS = 16;
 const uint8_t FAN_OFF = 0;
 const uint8_t FAN_ON  = 255;   // full speed (0-255)
 const unsigned long FAN_KICK_MS = 300; // spin-up help for low duty starts (optional)
-bool fanWasOff = true;
+bool fanOn = false;             // current fan power state (toggled by button)
 
 // Bi-colour 2-pin LED across D1/D2
 const int biPinA = 1;          // D1
@@ -23,6 +23,8 @@ float thresholdC = 22.0;       // Red if over threshold, else green
 // Momentary push buttons
 const int btnUpPin   = 8;      // Increase threshold by 1°C
 const int btnDownPin = 9;      // Decrease threshold by 1°C
+const int btnFanPin    = 3;    // Toggle fan on/off (normally open; other leg to btnFanGndPin)
+const int btnFanGndPin = 4;    // Driven LOW to act as ground for the fan button
 
 const unsigned long DEBOUNCE_MS          = 50;    // debounce window
 const unsigned long THRESHOLD_DISPLAY_MS = 2000;  // how long to show new threshold
@@ -47,6 +49,12 @@ int  btnDownStableState = HIGH;
 unsigned long btnDownLastChangeMs = 0;
 unsigned long btnDownPressedMs    = 0;
 unsigned long btnDownLastRepeatMs = 0;
+
+// Debounce state for fan-toggle button
+int  btnFanLastReading  = HIGH;
+int  btnFanStableState  = HIGH;
+unsigned long btnFanLastChangeMs  = 0;
+unsigned long btnFanPressedMs     = 0;
 
 // Threshold display state
 bool showingThreshold          = false;
@@ -325,6 +333,11 @@ void setup() {
   pinMode(btnUpPin,   INPUT_PULLUP);
   pinMode(btnDownPin, INPUT_PULLUP);
 
+  // Fan toggle button: pin 4 acts as a dedicated ground rail for the button
+  pinMode(btnFanGndPin, OUTPUT);
+  digitalWrite(btnFanGndPin, LOW);
+  pinMode(btnFanPin, INPUT_PULLUP);
+
   lcd.init();
   lcd.backlight();
 
@@ -369,6 +382,21 @@ void loop() {
   bool upHeld      = buttonHeldTick(btnUpStableState,   btnUpPressedMs,   btnUpLastRepeatMs,   now);
   bool downPressed = buttonPressed(btnDownPin, btnDownLastReading, btnDownStableState, btnDownLastChangeMs, btnDownPressedMs, btnDownLastRepeatMs, now);
   bool downHeld    = buttonHeldTick(btnDownStableState, btnDownPressedMs, btnDownLastRepeatMs, now);
+
+  // Fan toggle button (no hold-to-repeat — each press flips state once)
+  bool fanPressed = buttonPressed(btnFanPin, btnFanLastReading, btnFanStableState,
+                                  btnFanLastChangeMs, btnFanPressedMs, btnFanPressedMs, now);
+  if (fanPressed) {
+    fanOn = !fanOn;
+    if (fanOn) {
+      // Brief kick-start pulse to help motor spin up from rest
+      analogWrite(fanPin, 255);
+      delay(FAN_KICK_MS);
+      analogWrite(fanPin, FAN_ON);
+    } else {
+      analogWrite(fanPin, FAN_OFF);
+    }
+  }
 
   if (upPressed || upHeld) {
     if (thresholdC < THRESHOLD_MAX_C) {
@@ -429,22 +457,11 @@ void loop() {
     float avgC = getAverageC();
     int c10 = toTenths(avgC);
 
-    // LED + FAN based on averaged temperature
+    // LED only: reflect temperature vs threshold (fan is controlled independently)
     if (avgC > thresholdC) {
       biRed();
-
-      // Optional kick-start when turning on
-      if (fanWasOff) {
-        analogWrite(fanPin, 255);
-        delay(FAN_KICK_MS);
-        fanWasOff = false;
-      }
-
-      analogWrite(fanPin, FAN_ON);   // run fan (PWM)
     } else {
       biGreen();
-      analogWrite(fanPin, FAN_OFF);  // stop fan
-      fanWasOff = true;
     }
 
     bool tempChanged = (c10 != lastShownC10);
